@@ -1,0 +1,562 @@
+---
+title: "01_data_retrieval"
+output: html_document
+date: "2026-01-17"
+---
+
+```{r}
+library(hdf5r)
+f <- H5File$new("data/multiple-sclerosis-lineage-human-brain-10XV2-nuclei.loom", "r")
+
+mat_dims <- f[["matrix"]]$dims
+n_feat <- mat_dims[1]
+n_cell <- mat_dims[2]
+mat_dims
+
+```
+
+```{r}
+ls_with_dims <- function(g) {
+  x <- g$ls()
+  x$dim1 <- sapply(x$name, function(nm) as.integer(g[[nm]]$dims[1]))
+  x[, c("name","dataset.type_class","dim1")]
+}
+
+ca_info <- ls_with_dims(f[["col_attrs"]])
+ra_info <- ls_with_dims(f[["row_attrs"]])
+
+head(ca_info[order(ca_info$dim1), ], 12)
+head(ra_info[order(ra_info$dim1), ], 12)
+
+# how many datasets match cell length?
+sum(ca_info$dim1 == n_cell)
+sum(ra_info$dim1 == n_cell)
+
+```
+
+```{r}
+ca_cell_fields <- ca_info$name[ca_info$dim1 == n_cell]
+ra_cell_fields <- ra_info$name[ra_info$dim1 == n_cell]
+
+ca_cell_fields
+ra_cell_fields
+
+
+```
+
+```{r}
+pick_cell_id_field <- function(g, info, n_cell) {
+  preferred <- c("input_id","input_uuid","sample_id","donor_id","cell_names","CellID","barcode","barcodes")
+  have <- intersect(preferred, info$name[info$dim1 == n_cell])
+  if (length(have) > 0) return(have[1])
+
+  # fallback: any STRING dataset with correct length
+  cand <- info$name[info$dim1 == n_cell & info$dataset.type_class == "H5T_STRING"]
+  if (length(cand) == 0) return(NA_character_)
+  cand[1]
+}
+
+# decide which group has any cell-length fields
+cell_group <- if (sum(ca_info$dim1 == n_cell) > 0) "col_attrs" else if (sum(ra_info$dim1 == n_cell) > 0) "row_attrs" else NA
+stopifnot(!is.na(cell_group))
+
+cell_info <- if (cell_group == "col_attrs") ca_info else ra_info
+cell_attrs <- f[[cell_group]]
+
+cell_id_field <- pick_cell_id_field(cell_attrs, cell_info, n_cell)
+cell_group
+cell_id_field
+
+stopifnot(!is.na(cell_id_field))
+cell_ids <- cell_attrs[[cell_id_field]][]
+length(cell_ids)
+head(cell_ids, 10)
+
+```
+
+```{r}
+cell_string_fields <- cell_info$name[cell_info$dim1 == n_cell & cell_info$dataset.type_class == "H5T_STRING"]
+cell_string_fields
+
+```
+
+```{r}
+# read your manifest first 
+manifest <- read.delim("data/MultipleSclerosisLineageDiversity 2026-01-17 12.57.tsv", sep="\t", quote="", stringsAsFactors=FALSE, check.names=FALSE)
+
+manifest_id_cols <- intersect(
+  c(
+    "sequencing_input.biomaterial_core.biomaterial_id",
+    "sample.biomaterial_core.biomaterial_id",
+    "cell_suspension.biomaterial_core.biomaterial_id",
+    "donor_organism.biomaterial_core.biomaterial_id",
+    "sequencing_input.provenance.document_id",
+    "sample.provenance.document_id",
+    "cell_suspension.provenance.document_id",
+    "donor_organism.provenance.document_id",
+    "bundle_uuid",
+    "file_uuid",
+    "file_document_id",
+    "file_name"
+  ),
+  names(manifest)
+)
+
+# try every cell-level STRING field vs every manifest id col; score by overlap
+scores <- list()
+
+for (cf in cell_string_fields) {
+  v <- unique(trimws(as.character(cell_attrs[[cf]][])))
+  v <- v[!is.na(v) & v != ""]
+  for (mc in manifest_id_cols) {
+    m <- unique(trimws(as.character(manifest[[mc]])))
+    m <- m[!is.na(m) & m != ""]
+    scores[[paste(cf, mc, sep="__")]] <- sum(v %in% m)
+  }
+}
+
+scores_vec <- unlist(scores)
+scores_vec <- sort(scores_vec, decreasing = TRUE)
+head(scores_vec, 20)
+
+```
+
+```{r}
+cell_attrs <- f[["col_attrs"]]
+
+cell_input <- cell_attrs[["input_id"]][]  # length 822989
+length(cell_input)
+head(cell_input, 5)
+length(unique(cell_input))
+head(sort(unique(cell_input)), 10)
+
+```
+
+```{r}
+loom_inputs <- sort(unique(trimws(as.character(cell_input))))
+
+# columns that might contain UUIDs (or are known IDs)
+uuidish_cols <- names(manifest)[
+  grepl("uuid|document_id|provenance\\.document_id|biomaterial_id|source_id|file_|bundle_", names(manifest))
+]
+
+# compute overlap for each candidate column
+overlap_all <- sapply(uuidish_cols, function(col) {
+  vals <- trimws(as.character(manifest[[col]]))
+  sum(vals %in% loom_inputs, na.rm = TRUE)
+})
+
+overlap_all <- sort(overlap_all, decreasing = TRUE)
+head(overlap_all, 30)
+
+```
+
+```{r}
+best_col <- names(overlap_all)[1]
+best_col
+overlap_all[1]
+
+# show the actual matching values
+matched <- intersect(loom_inputs, unique(trimws(as.character(manifest[[best_col]]))))
+matched
+length(matched)
+
+```
+
+```{r}
+sex_col <- "donor_organism.sex"
+
+disease_col <- if ("specimen_from_organism.diseases" %in% names(manifest)) {
+  "specimen_from_organism.diseases"
+} else if ("donor_organism.diseases" %in% names(manifest)) {
+  "donor_organism.diseases"
+} else {
+  stop("No disease column found in manifest.")
+}
+
+meta <- manifest[, c(best_col, sex_col, disease_col), drop = FALSE]
+names(meta) <- c("input_uuid", "sex", "disease_raw")
+
+meta$input_uuid <- trimws(as.character(meta$input_uuid))
+meta$sex <- toupper(substr(trimws(as.character(meta$sex)), 1, 1))
+meta$disease_raw <- trimws(as.character(meta$disease_raw))
+meta$disease_raw[is.na(meta$disease_raw)] <- ""
+
+# keep only the 21 inputs that exist in the loom
+meta <- meta[meta$input_uuid %in% loom_inputs, , drop = FALSE]
+meta <- meta[!duplicated(meta$input_uuid), , drop = FALSE]
+
+meta$condition <- ifelse(grepl("multiple sclerosis|\\bms\\b", meta$disease_raw, ignore.case = TRUE),
+                         "MS", "Control")
+
+table(meta$condition, meta$sex, useNA = "ifany")
+nrow(meta)   # should be 21
+
+```
+
+```{r}
+set.seed(1)
+
+pick_3m3f <- function(meta, cond) {
+  m <- unique(meta$input_uuid[meta$condition == cond & meta$sex == "M"])
+  f <- unique(meta$input_uuid[meta$condition == cond & meta$sex == "F"])
+  stopifnot(length(m) >= 3, length(f) >= 3)
+  c(sample(m, 3), sample(f, 3))
+}
+
+ctl_ids <- pick_3m3f(meta, "Control")
+ms_ids  <- pick_3m3f(meta, "MS")
+selected_ids <- c(ctl_ids, ms_ids)
+
+keep_cells <- which(trimws(as.character(cell_input)) %in% selected_ids)
+length(keep_cells)
+
+# sanity check counts by sample
+table(trimws(as.character(cell_input))[keep_cells])
+
+```
+
+```{r}
+mat_sub <- f[["matrix"]][keep_cells, ]
+mat_sub$dims
+
+```
+
+```{r}
+# cell_input: length 822989, one of 21 UUIDs per cell
+# selected_ids: the 12 UUIDs (3M+3F Control + 3M+3F MS)
+
+keep_cells <- which(trimws(as.character(cell_input)) %in% trimws(as.character(selected_ids)))
+length(keep_cells)      # how many nuclei you are keeping
+
+```
+
+```{r}
+library(HDF5Array)
+library(DelayedArray)
+
+loom_path <- "data/multiple-sclerosis-lineage-human-brain-10XV2-nuclei.loom"
+
+# HDF5-backed DelayedMatrix pointing to /matrix (cells x genes in your file)
+mat_d <- HDF5Array(loom_path, "matrix")  # DelayedMatrix
+
+dim(mat_d)   # should be 822989 x 58347
+
+# subset view (still on disk, not read fully)
+mat_sub_d <- mat_d[keep_cells, ]
+dim(mat_sub_d)
+
+
+```
+
+```{r}
+Sys.setenv(HDF5_USE_FILE_LOCKING = "FALSE")
+
+# Close any previous handles if they exist
+if (exists("src")) try(src$close_all(), silent = TRUE)
+if (exists("dst")) try(dst$close_all(), silent = TRUE)
+gc()
+
+# ---- OPEN SOURCE + CREATE DEST ----
+src <- hdf5r::H5File$new(loom_path, mode = "r")
+src
+
+dst_path <- "data/ms_12samples_subset.h5"
+if (file.exists(dst_path)) file.remove(dst_path)   # avoid "truncate already open"
+dst <- hdf5r::H5File$new(dst_path, mode = "w")
+
+# ---- SOURCE DATASET ----
+src_mat <- src[["matrix"]]
+n_genes <- src_mat$dims[2]
+n_keep  <- length(keep_cells)
+
+# Create destination dataset with chunking
+chunk_ncell <- min(2000L, n_keep)
+chunk_ngene <- min(2000L, n_genes)
+
+# IMPORTANT: define datatype via a tiny sample block (avoids dtype issues)
+sample_block <- src_mat[keep_cells[1], 1:1, drop = FALSE]
+
+dst_mat <- dst$create_dataset(
+  name = "matrix",
+  dims = c(n_keep, n_genes),
+  chunk_dims = c(chunk_ncell, chunk_ngene),
+  robj = sample_block
+)
+
+# ---- CHUNKED ROW COPY (no huge RAM use) ----
+block <- 1000L
+for (ii in seq(1L, n_keep, by = block)) {
+  jj <- min(ii + block - 1L, n_keep)
+  rows <- keep_cells[ii:jj]
+  dst_mat[ii:jj, ] <- src_mat[rows, ]
+  cat("Copied rows", ii, "to", jj, "of", n_keep, "\n")
+}
+
+# ---- COPY GENE ANNOTATIONS (row_attrs are gene-level: length == n_genes) ----
+dst$create_group("gene_attrs")
+for (nm in src[["row_attrs"]]$ls()$name) {
+  if (as.integer(src[["row_attrs"]][[nm]]$dims[1]) == n_genes) {
+    src[["row_attrs"]]$copy_to(dst[["gene_attrs"]], name = nm)
+  }
+}
+
+
+```
+
+```{r}
+# ---- COPY GENE ANNOTATIONS (row_attrs are feature-level: length == n_genes) ----
+dst$create_group("gene_attrs")
+
+row_attr_names <- src[["row_attrs"]]$ls()$name
+
+for (nm in row_attr_names) {
+  d <- src[["row_attrs"]][[nm]]
+  if (as.integer(d$dims[1]) == n_genes) {
+    # read into memory (safe: length ~58k) and write as dataset
+    v <- d[]
+    dst[["gene_attrs"]]$create_dataset(
+      name = nm,
+      dims = length(v),
+      chunk_dims = min(10000L, length(v)),
+      robj = v
+    )
+  }
+}
+
+# ---- COPY CELL ANNOTATIONS (col_attrs are cell-level: length == src_mat$dims[1]) ----
+dst$create_group("cell_attrs")
+
+cell_attr_names <- src[["col_attrs"]]$ls()$name
+chunk <- 20000L
+
+for (nm in cell_attr_names) {
+  dsrc <- src[["col_attrs"]][[nm]]
+
+  # only copy datasets that are truly cell-length in the source file
+  if (as.integer(dsrc$dims[1]) != as.integer(src_mat$dims[1])) next
+
+  # template value to set dtype correctly (works for numeric + string)
+  template <- dsrc[keep_cells[1]]
+  if (length(template) == 0) next
+
+  ddst <- dst[["cell_attrs"]]$create_dataset(
+    name = nm,
+    dims = c(n_keep),
+    chunk_dims = c(min(chunk, n_keep)),
+    robj = template
+  )
+
+  for (ii in seq(1L, n_keep, by = chunk)) {
+    jj <- min(ii + chunk - 1L, n_keep)
+    rows <- keep_cells[ii:jj]
+    ddst[ii:jj] <- dsrc[rows]
+  }
+}
+
+```
+
+```{r}
+Sys.setenv(HDF5_USE_FILE_LOCKING = "FALSE")
+
+library(hdf5r)
+
+# -----------------------------
+# Paths
+# -----------------------------
+loom_path <- "data/multiple-sclerosis-lineage-human-brain-10XV2-nuclei.loom"
+manifest_path <- "data/MultipleSclerosisLineageDiversity 2026-01-17 12.57.tsv"
+dst_path <- "data/ms_12samples_subset.h5"
+
+# -----------------------------
+# Helper functions
+# -----------------------------
+ensure_group <- function(h5, group_name) {
+  existing <- h5$ls()$name
+  if (group_name %in% existing) h5[[group_name]] else h5$create_group(group_name)
+}
+
+# -----------------------------
+# Open source + read manifest
+# -----------------------------
+src <- hdf5r::H5File$new(loom_path, mode = "r")
+manifest <- read.delim(manifest_path, sep = "\t", quote = "", stringsAsFactors = FALSE, check.names = FALSE)
+
+src_mat <- src[["matrix"]]
+n_total_cells <- as.integer(src_mat$dims[1])
+n_genes <- as.integer(src_mat$dims[2])
+
+# In THIS file, col_attrs length == matrix rows == "cells"
+cell_attrs <- src[["col_attrs"]]
+stopifnot("input_id" %in% cell_attrs$ls()$name)
+
+cell_input <- trimws(as.character(cell_attrs[["input_id"]][]))
+stopifnot(length(cell_input) == n_total_cells)
+
+loom_inputs <- sort(unique(cell_input))
+stopifnot(length(loom_inputs) >= 12)  # you observed 21
+
+# -----------------------------
+# Find manifest column that matches those input UUIDs
+# -----------------------------
+uuidish_cols <- names(manifest)[
+  grepl("uuid|document_id|provenance\\.document_id|biomaterial_id|source_id|file_|bundle_", names(manifest))
+]
+
+overlap_all <- sapply(uuidish_cols, function(col) {
+  vals <- trimws(as.character(manifest[[col]]))
+  sum(vals %in% loom_inputs, na.rm = TRUE)
+})
+
+overlap_all <- sort(overlap_all, decreasing = TRUE)
+best_col <- names(overlap_all)[1]
+stopifnot(overlap_all[1] > 0)
+
+# -----------------------------
+# Build sample-level metadata
+# -----------------------------
+sex_col <- "donor_organism.sex"
+disease_col <- if ("specimen_from_organism.diseases" %in% names(manifest)) {
+  "specimen_from_organism.diseases"
+} else if ("donor_organism.diseases" %in% names(manifest)) {
+  "donor_organism.diseases"
+} else {
+  stop("No disease column found in manifest.")
+}
+
+meta <- manifest[, c(best_col, sex_col, disease_col), drop = FALSE]
+names(meta) <- c("input_uuid", "sex", "disease_raw")
+
+meta$input_uuid <- trimws(as.character(meta$input_uuid))
+meta$sex <- toupper(substr(trimws(as.character(meta$sex)), 1, 1))
+meta$disease_raw <- trimws(as.character(meta$disease_raw))
+meta$disease_raw[is.na(meta$disease_raw)] <- ""
+
+meta <- meta[meta$input_uuid %in% loom_inputs, , drop = FALSE]
+meta <- meta[!duplicated(meta$input_uuid), , drop = FALSE]
+
+meta$condition <- ifelse(
+  grepl("multiple sclerosis|\\bms\\b", meta$disease_raw, ignore.case = TRUE),
+  "MS", "Control"
+)
+
+# sanity
+print(table(meta$condition, meta$sex, useNA = "ifany"))
+
+# -----------------------------
+# Pick 3M+3F per condition
+# -----------------------------
+set.seed(1)
+
+pick_3m3f <- function(meta, cond) {
+  m <- unique(meta$input_uuid[meta$condition == cond & meta$sex == "M"])
+  f <- unique(meta$input_uuid[meta$condition == cond & meta$sex == "F"])
+  stopifnot(length(m) >= 3, length(f) >= 3)
+  c(sample(m, 3), sample(f, 3))
+}
+
+ctl_ids <- pick_3m3f(meta, "Control")
+ms_ids  <- pick_3m3f(meta, "MS")
+selected_ids <- c(ctl_ids, ms_ids)
+
+print(selected_ids)
+
+# -----------------------------
+# Keep ALL cells from selected samples
+# -----------------------------
+keep_cells <- which(cell_input %in% selected_ids)
+n_keep <- length(keep_cells)
+
+cat("Keeping", n_keep, "cells from", length(selected_ids), "samples\n")
+print(table(cell_input[keep_cells]))
+
+stopifnot(n_keep > 0)
+
+# -----------------------------
+# Create destination file fresh
+# -----------------------------
+if (file.exists(dst_path)) file.remove(dst_path)
+
+dst <- hdf5r::H5File$new(dst_path, mode = "w")
+
+# -----------------------------
+# Create + copy MATRIX in chunks (no huge RAM)
+# -----------------------------
+chunk_ncell <- min(2000L, n_keep)
+chunk_ngene <- min(2000L, n_genes)
+
+# dtype template (1x1)
+template_block <- src_mat[keep_cells[1], 1:1]
+
+dst_mat <- dst$create_dataset(
+  name = "matrix",
+  dims = c(n_keep, n_genes),
+  chunk_dims = c(chunk_ncell, chunk_ngene),
+  robj = template_block
+)
+
+block <- 1000L
+for (ii in seq(1L, n_keep, by = block)) {
+  jj <- min(ii + block - 1L, n_keep)
+  rows <- keep_cells[ii:jj]
+  dst_mat[ii:jj, ] <- src_mat[rows, ]
+  if (ii == 1L || ii %% (block * 10L) == 1L) {
+    cat("Copied matrix rows", ii, "to", jj, "of", n_keep, "\n")
+  }
+}
+
+# -----------------------------
+# Copy GENE annotations (row_attrs length == n_genes) safely
+# -----------------------------
+gene_grp <- ensure_group(dst, "gene_attrs")
+row_attr_names <- src[["row_attrs"]]$ls()$name
+
+for (nm in row_attr_names) {
+  d <- src[["row_attrs"]][[nm]]
+  if (as.integer(d$dims[1]) == n_genes) {
+    v <- d[]  # safe (~58k)
+    gene_grp$create_dataset(
+      name = nm,
+      dims = length(v),
+      chunk_dims = min(10000L, length(v)),
+      robj = v
+    )
+  }
+}
+
+# -----------------------------
+# Copy CELL annotations (col_attrs length == n_total_cells) in chunks
+# -----------------------------
+cell_grp <- ensure_group(dst, "cell_attrs")
+col_attr_names <- src[["col_attrs"]]$ls()$name
+
+chunk <- 20000L
+for (nm in col_attr_names) {
+  dsrc <- src[["col_attrs"]][[nm]]
+  if (as.integer(dsrc$dims[1]) != n_total_cells) next
+
+  # 1-element template
+  templ <- dsrc[keep_cells[1]]
+  ddst <- cell_grp$create_dataset(
+    name = nm,
+    dims = c(n_keep),
+    chunk_dims = c(min(chunk, n_keep)),
+    robj = templ
+  )
+
+  for (ii in seq(1L, n_keep, by = chunk)) {
+    jj <- min(ii + chunk - 1L, n_keep)
+    rows <- keep_cells[ii:jj]
+    ddst[ii:jj] <- dsrc[rows]
+  }
+}
+
+# -----------------------------
+# Close and report
+# -----------------------------
+src$close_all()
+dst$close_all()
+
+cat("Wrote subset to:", dst_path, "\n")
+
+```
