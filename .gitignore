@@ -3,3 +3,7 @@
 .RData
 .Ruserdata
 .Rproj
+.csv
+.tsv
+.loom
+.h5

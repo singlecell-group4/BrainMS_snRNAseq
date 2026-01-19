@@ -1,0 +1,253 @@
+---
+title: "01_data_retrieval_and_subset"
+output: html_document
+date: "2026-01-17"
+---
+
+```{r}
+# Avoid issues with H5 files
+Sys.setenv(HDF5_USE_FILE_LOCKING = "FALSE")
+#load library for reading
+library(hdf5r)
+```
+
+```{r}
+loom_path <- "data/multiple-sclerosis-lineage-human-brain-10XV2-nuclei.loom"
+manifest_path <- "data/MultipleSclerosisLineageDiversity 2026-01-17 12.57.tsv"
+dst_path <- "data/ms_12samples_subset_2.h5"
+```
+
+```{r}
+src <- hdf5r::H5File$new(loom_path, mode = "r")
+
+src_mat <- src[["matrix"]]
+mat_dims <- src_mat$dims
+mat_dims # (n_cells x n_features) in this file
+
+n_total_cells <- as.integer(mat_dims[1])
+n_features <- as.integer(mat_dims[2])
+
+#Confirm col_attrs are cell-level (same length as matrix rows)
+
+stopifnot(all(vapply(src[["col_attrs"]]$ls()$name,
+function(nm) as.integer(src[["col_attrs"]][[nm]]$dims[1]),
+integer(1)) == n_total_cells))
+```
+
+```{r}
+#Load sample manifest (kinf of metadata to have diagnosis and sex in data)
+manifest <- read.delim(
+manifest_path,
+sep = "\t",
+quote = "",
+stringsAsFactors = FALSE,
+check.names = FALSE
+)
+
+```
+
+Get per-cell sample UUIDs from the loom (`col_attrs/input_id`)
+
+```{r}
+cell_input <- trimws(as.character(src[["col_attrs"]][["input_id"]][]))
+stopifnot(length(cell_input) == n_total_cells)
+
+loom_inputs <- sort(unique(cell_input))
+length(loom_inputs)   # expected 21
+head(loom_inputs, 10)
+
+```
+
+Find the manifest column that matches these UUIDs
+
+```{r}
+uuidish_cols <- names(manifest)[
+grepl("uuid|document_id|provenance\\.document_id|biomaterial_id|source_id|file_|bundle_", names(manifest))
+]
+
+overlap_all <- sapply(uuidish_cols, function(col) {
+vals <- trimws(as.character(manifest[[col]]))
+sum(vals %in% loom_inputs, na.rm = TRUE)
+})
+overlap_all <- sort(overlap_all, decreasing = TRUE)
+
+best_col <- names(overlap_all)[1]
+best_overlap <- unname(overlap_all[1])
+
+best_col
+best_overlap
+stopifnot(best_overlap > 0)
+
+```
+
+Build sample metadata (sex + MS/control)
+
+```{r}
+sex_col <- "donor_organism.sex"
+
+disease_col <- if ("specimen_from_organism.diseases" %in% names(manifest)) {
+"specimen_from_organism.diseases"
+} else if ("donor_organism.diseases" %in% names(manifest)) {
+"donor_organism.diseases"
+} else {
+stop("No disease column found in manifest.")
+}
+
+meta <- manifest[, c(best_col, sex_col, disease_col), drop = FALSE]
+names(meta) <- c("input_uuid", "sex", "disease_raw")
+
+meta$input_uuid  <- trimws(as.character(meta$input_uuid))
+meta$sex         <- toupper(substr(trimws(as.character(meta$sex)), 1, 1))
+meta$disease_raw <- trimws(as.character(meta$disease_raw))
+meta$disease_raw[is.na(meta$disease_raw)] <- ""
+
+# keep only samples present in loom and collapse duplicates
+
+meta <- meta[meta$input_uuid %in% loom_inputs, , drop = FALSE]
+meta <- meta[!duplicated(meta$input_uuid), , drop = FALSE]
+
+meta$condition <- ifelse(
+grepl("multiple sclerosis|\bms\b", meta$disease_raw, ignore.case = TRUE),
+"MS", "Control"
+)
+
+table(meta$condition, meta$sex, useNA = "ifany")
+nrow(meta)  # expected 21
+
+```
+
+Select 3 male + 3 female per condition
+
+```{r}
+set.seed(1)
+
+pick_3m3f <- function(meta, cond) {
+m <- unique(meta$input_uuid[meta$condition == cond & meta$sex == "M"])
+f <- unique(meta$input_uuid[meta$condition == cond & meta$sex == "F"])
+stopifnot(length(m) >= 3, length(f) >= 3)
+c(sample(m, 3), sample(f, 3))
+}
+
+ctl_ids <- pick_3m3f(meta, "Control")
+ms_ids  <- pick_3m3f(meta, "MS")
+selected_ids <- c(ctl_ids, ms_ids)
+
+selected_ids
+
+```
+
+Keep all nuclei from the selected 12 samples
+
+```{r}
+keep_cells <- which(cell_input %in% selected_ids)
+n_keep <- length(keep_cells)
+
+cat("Keeping", n_keep, "cells from", length(selected_ids), "samples\n")
+table(cell_input[keep_cells])
+
+stopifnot(n_keep > 0)
+
+```
+
+Export the subset to a new file
+
+```{r}
+ensure_group <- function(h5, group_name) {
+existing <- h5$ls()$name
+if (group_name %in% existing) h5[[group_name]] else h5$create_group(group_name)
+}
+
+# Create destination fresh
+
+if (file.exists(dst_path)) file.remove(dst_path)
+dst <- hdf5r::H5File$new(dst_path, mode = "w")
+
+# Create + copy MATRIX in chunks
+
+chunk_ncell <- min(2000L, n_keep)
+chunk_ngene <- min(2000L, n_features)
+
+template_block <- src_mat[keep_cells[1], 1:1]  # 1x1 dtype template
+
+dst_mat <- dst$create_dataset(
+name = "matrix",
+dims = c(n_keep, n_features),
+chunk_dims = c(chunk_ncell, chunk_ngene),
+robj = template_block
+)
+
+block <- 1000L
+for (ii in seq(1L, n_keep, by = block)) {
+jj <- min(ii + block - 1L, n_keep)
+rows <- keep_cells[ii:jj]
+dst_mat[ii:jj, ] <- src_mat[rows, ]
+
+# progress every 10 chunks + first chunk
+
+if (ii == 1L || ii %% (block * 10L) == 1L) {
+cat("Copied matrix rows", ii, "to", jj, "of", n_keep, "\n")
+}
+}
+
+# Copy FEATURE (gene) annotations from row_attrs (length == n_features)
+
+gene_grp <- ensure_group(dst, "gene_attrs")
+row_attr_names <- src[["row_attrs"]]$ls()$name
+
+for (nm in row_attr_names) {
+d <- src[["row_attrs"]][[nm]]
+if (as.integer(d$dims[1]) == n_features) {
+v <- d[]  # safe (~58k)
+gene_grp$create_dataset(
+name = nm,
+dims = length(v),
+chunk_dims = min(10000L, length(v)),
+robj = v
+)
+}
+}
+
+# Copy CELL annotations from col_attrs (subset to kept cells) in chunks
+
+cell_grp <- ensure_group(dst, "cell_attrs")
+col_attr_names <- src[["col_attrs"]]$ls()$name
+
+chunk <- 20000L
+for (nm in col_attr_names) {
+dsrc <- src[["col_attrs"]][[nm]]
+if (as.integer(dsrc$dims[1]) != n_total_cells) next
+
+templ <- dsrc[keep_cells[1]]
+ddst <- cell_grp$create_dataset(
+name = nm,
+dims = c(n_keep),
+chunk_dims = c(min(chunk, n_keep)),
+robj = templ
+)
+
+for (ii in seq(1L, n_keep, by = chunk)) {
+jj <- min(ii + chunk - 1L, n_keep)
+rows <- keep_cells[ii:jj]
+ddst[ii:jj] <- dsrc[rows]
+}
+}
+
+# Close files
+
+src$close_all()
+dst$close_all()
+
+cat("Wrote subset to:", dst_path, "\n")
+
+```
+
+Double check the new file:
+
+```{r}
+sub <- hdf5r::H5File$new(dst_path, mode = "r")
+sub[["matrix"]]$dims
+sub[["cell_attrs"]]$ls()[1:5, c("name","dataset.dims","dataset.type_class")]
+sub[["gene_attrs"]]$ls()[1:5, c("name","dataset.dims","dataset.type_class")]
+sub$close_all()
+
+```

@@ -1,0 +1,391 @@
+---
+title: "02_QC_and_filtering"
+output: html_document
+---
+
+# Converting the data into a Seurat object
+
+Load libraries
+
+```{r}
+library(hdf5r)
+library(Matrix)
+library(Seurat)
+
+```
+
+```{r}
+sub <- H5File$new("/home/projects/exam_2026_22102/group4/data/ms_12samples_subset.h5", "r")
+
+m <- sub[["matrix"]]
+n_cells <- m$dims[1]
+n_genes <- m$dims[2]
+
+n_cells
+n_genes
+
+```
+
+```{r}
+gene_names <- as.character(sub[["gene_attrs"]][["gene_names"]][])
+
+# fallback if needed
+if (is.null(gene_names) || anyNA(gene_names)) {
+  gene_names <- as.character(sub[["gene_attrs"]][["Gene"]][])
+}
+
+cell_names <- as.character(sub[["cell_attrs"]][["cell_names"]][])
+
+length(gene_names)
+length(cell_names)
+
+```
+
+```{r}
+block <- 5000L
+i_list <- list()
+j_list <- list()
+x_list <- list()
+
+for (i in seq(1L, n_cells, by = block)) {
+  j <- min(i + block - 1L, n_cells)
+  cat("Reading cells", i, "to", j, "\n")
+
+  chunk <- m[i:j, ]                # dense block
+  nz <- which(chunk != 0, arr.ind = TRUE)
+
+  if (nrow(nz) > 0) {
+    i_list[[length(i_list)+1]] <- nz[,1] + i - 1L
+    j_list[[length(j_list)+1]] <- nz[,2]
+    x_list[[length(x_list)+1]] <- chunk[nz]
+  }
+}
+
+i <- unlist(i_list)
+j <- unlist(j_list)
+x <- unlist(x_list)
+
+counts <- sparseMatrix(
+  i = i,
+  j = j,
+  x = x,
+  dims = c(n_cells, n_genes),
+  dimnames = list(cell_names, gene_names)
+)
+
+```
+
+Create the Seurat object
+
+```{r}
+# 1) Ensure gene names are unique (this is important even if you think they are)
+gene_names <- make.unique(gene_names)
+
+# 2) Make sure cell IDs are unique (even if cell_names are unique, this is harmless)
+# If you already built cell_ids = paste(input_id, cell_names, sep="_"), use that:
+# cell_ids <- cell_ids
+cell_ids <- make.unique(cell_names)
+
+# 3) Put matrix in Seurat orientation: genes x cells
+# If your current 'counts' is cells x genes, transpose it:
+counts <- Matrix::t(counts)
+
+# 4) Set dimnames correctly AFTER transpose
+rownames(counts) <- gene_names
+colnames(counts) <- cell_ids
+
+# 5) Now create Seurat object
+seu <- CreateSeuratObject(
+  counts = counts,
+  project = "MS_snRNAseq",
+  min.cells = 0,
+  min.features = 0
+)
+
+```
+
+Change a bit the format of colnames by prefixing the input_id (this will allow do pseudobulk DEA more easily)
+
+```{r}
+# Ensure feature names are unique
+rownames(counts) <- make.unique(rownames(counts))
+
+# Set best-practice cell IDs
+cell_ids <- paste(
+  sub[["cell_attrs"]][["input_id"]][],
+  sub[["cell_attrs"]][["cell_names"]][],
+  sep = "_"
+)
+colnames(counts) <- make.unique(cell_ids)
+
+seu <- CreateSeuratObject(
+  counts = counts,
+  project = "MS_snRNAseq"
+)
+```
+
+Add metadata
+
+```{r}
+cell_meta <- as.data.frame(lapply(
+  sub[["cell_attrs"]]$ls()$name,
+  function(nm) sub[["cell_attrs"]][[nm]][]
+))
+colnames(cell_meta) <- sub[["cell_attrs"]]$ls()$name
+rownames(cell_meta) <- cell_names
+
+seu <- AddMetaData(seu, cell_meta)
+
+```
+
+Close file
+
+```{r}
+sub$close_all()
+```
+
+Save the Seurat object as RDS
+
+```{r}
+saveRDS(seu, file = "/home/projects/exam_2026_22102/group4/data/seu_raw_12samples.rds", compress = "xz")
+
+```
+
+# QC and filtering
+
+There is no need to read the file again as we have it already in the environment, but just in case we want to run the QC and filtering without running the first part:
+
+```{r}
+ms_data <- readRDS("/home/projects/exam_2026_22102/group4/data/seu_raw_12samples.rds")
+```
+
+Let's inspect the file metadata
+
+```{r}
+head(ms_data@meta.data)
+```
+
+Even though the mitochondrial percentage is calculated already in our dataset, let's double check and calculate ribosomal and hemoglobin genes too:
+
+```{r}
+ms_data[["percent.mt"]] <- PercentageFeatureSet(ms_data, pattern = "^MT-")
+
+ms_data[["percent.hb"]] <- PercentageFeatureSet(ms_data, "^HB[ABDGZ]")
+
+ms_data[["percent.rb"]] <- PercentageFeatureSet(ms_data, "^RP[SL]")
+```
+
+Visualize the QC metrics to determine the cutoff:
+
+```{r}
+library(ggplot2)
+#to have one plot per feature instead of one per nuclei:
+Idents(ms_data) <- "all"
+#now plot (pt.size = 0) because if not the plot is not visible
+p <- VlnPlot(
+  ms_data, 
+  features = c("nFeature_RNA","nCount_RNA"), 
+  pt.size = 0, 
+  layer = "counts"
+  ) +
+  theme(legend.position = "none")
+p
+
+```
+
+```{r}
+p <- VlnPlot(
+  ms_data, 
+  features = c("percent.mt","percent.hb", "percent.rb"), 
+  pt.size = 0, 
+  layer = "counts"
+  ) +
+  theme(
+    legend.position = "none"
+    )
+p
+
+```
+
+Now we will filter the object based on the QC metrics (the metrics are modified from the PBMCs exercise from week2 to be good for single-nuclei experiments and post-mortem samples):
+
+```{r}
+ms_data.filtered <- subset(
+  ms_data,
+  subset =
+    nFeature_RNA >= 50 &
+    nFeature_RNA <= 6000 &
+    nCount_RNA   >= 100 &
+    nCount_RNA   <= 20000 &
+    percent.mt   <= 16
+)
+```
+
+We filtered nuclei with nFeature_RNA \> 50 and nCount_RNA \> 100 to remove low complexity droplets or empty. To exclude high RNA outliers (probably doublets), we limited nFeature_RNA \< 6000 and nCount_RNA \< 20000, which corresponds to approximately the 99.5th and 99.9th percentiles of the dataset. We also filtered nuclei with percent_mt \< 16 to remove damaged nuclei, which is less stringent than in PBMCs exercise, but it is appropiate for post-mortem snRNA-Seq, where the mitochondrial fractions are higher (as shown in the percentiles).
+
+```{r}
+print("Count_RNA")
+quantile(ms_data$nCount_RNA, c(0.99,0.995,0.999))
+print("Feature_RNA")
+quantile(ms_data$nFeature_RNA, c(0.99,0.995,0.999))
+print("Mito %")
+quantile(ms_data$percent.mt, c(0.95,0.98,0.99))
+
+```
+
+```{r}
+ncol(ms_data.filtered) / ncol(ms_data)
+```
+
+We removed around 32% of the nuclei after this QC filtering.
+
+# Normalization
+
+```{r}
+ms_data.filtered <- NormalizeData(
+  ms_data.filtered, 
+  normalization.method = "LogNormalize", 
+  scale.factor = 10000
+  )
+```
+
+After normalization, we will identify the highly variable features:
+
+```{r}
+ms_data.filtered <- FindVariableFeatures(
+  ms_data.filtered,                                          
+  selection.method = "vst", 
+  nfeatures = 2000
+  )
+```
+
+Now let's plot the 10 most highly variable genes:
+
+```{r}
+top10 <- head(VariableFeatures(ms_data.filtered), 10)
+#plt
+plot1 <- VariableFeaturePlot(ms_data.filtered)
+plot2 <- LabelPoints(plot = plot1, points = top10, repel = TRUE)
+plot2
+
+ggsave("variable_features.png", plot2, width = 7, height = 5, dpi = 300)
+
+```
+
+# Scaling data
+
+```{r}
+ms_data.filtered <- ScaleData(ms_data.filtered, vars.to.regress = "percent.mt")
+```
+
+Given the relatively high threshold chosen for percent.mt, we will regress to this variable when scaling, as it can reflect damaged nuclei, and it could affect clustering.
+
+```{r}
+saveRDS(ms_data.filtered, file = "/home/projects/exam_2026_22102/group4/data/ms_filtered.rds", compress = "xz")
+```
+
+# Visualization
+
+## PCA (linear dimensionality reduction)
+
+```{r}
+ms_data.filtered <- RunPCA(ms_data.filtered, features = VariableFeatures(object = ms_data.filtered))
+```
+
+## Elbow plot
+
+```{r}
+ElbowPlot(ms_data.filtered)
+```
+
+This elbow plot shows that variance flattens around PC10, showing an elbow around PC6-8. We decided to be a bit conservative and keep 15 dimensions. We now perform kNN clustering with Leiden algorithm.
+
+```{r}
+ms_data.filtered <- FindNeighbors(ms_data.filtered, dims = 1:15)
+ms_data.filtered <- FindClusters(ms_data.filtered, resolution = c(0.3, 0.5, 0.7, 0.9, 1.1), algorithm=4)
+```
+
+## UMAP (non-linear dim reduction)
+
+We now perform UMAP and plot them using the different resolutions. Due to working with brain samples, where the cell population is quite diverse (microglia and neuron subtypes9 and that we want to perform analyses on specific cell types, we will probably need a high resolution.
+
+```{r}
+ms_data.filtered <- RunUMAP(ms_data.filtered, dims = 1:15)
+p1 <- DimPlot(ms_data.filtered, reduction = "umap")
+```
+
+### Resolution 0.3
+
+```{r}
+DimPlot(ms_data.filtered, group.by = "RNA_snn_res.0.3", label = TRUE)
+```
+
+### Resolution 0.5
+
+```{r}
+DimPlot(ms_data.filtered, group.by = "RNA_snn_res.0.5", label = TRUE)
+```
+
+### Resolution 0.7
+
+```{r}
+DimPlot(ms_data.filtered, group.by = "RNA_snn_res.0.7", label = TRUE)
+```
+
+### Resolution 0.9
+
+```{r}
+DimPlot(ms_data.filtered, group.by = "RNA_snn_res.0.9", label = TRUE)
+```
+
+# Reproducing results from paper
+
+```{r}
+library(Seurat)
+library(Matrix)
+
+set.seed(1)
+DefaultAssay(ms_data) <- "RNA"
+
+# --- (Optional) basic QC filter first (use your chosen thresholds) ---
+ms <- ms_data
+
+# --- 1) Filter genes expressed in > 5 nuclei (paper) ---
+counts <- GetAssayData(ms, assay = "RNA", slot = "counts")
+keep_genes <- Matrix::rowSums(counts > 0) > 5
+ms <- subset(ms, features = names(keep_genes)[keep_genes])
+
+# --- 2) "Filtered log-transformed UMI matrix" (paper) ---
+# This is Seurat's LogNormalize (counts per cell -> scale.factor -> log1p)
+ms <- NormalizeData(ms, normalization.method = "LogNormalize", scale.factor = 10000, verbose = FALSE)
+
+# --- 3) Truncated SVD with k=50 (paper) ---
+# RunPCA with approx=TRUE uses a truncated SVD under the hood.
+# To stay closer to "SVD on log matrix", we avoid centering/scaling here.
+ms <- ScaleData(ms, features = rownames(ms), do.center = FALSE, do.scale = FALSE, verbose = FALSE)
+ms <- RunPCA(ms, npcs = 50, approx = TRUE, verbose = FALSE)
+
+# --- 4) Select 11 PCs (paper chose 11) ---
+dims_use <- 1:11
+
+# --- 5) kNN size = sqrt(# nuclei) (paper) ---
+k_nn <- floor(sqrt(ncol(ms)))   # they say "root square of number of nuclei"
+
+# --- 6) Jaccard-weighted neighbor graph + Louvain (paper) ---
+# Seurat's SNN graph is conceptually the same "shared neighbors / Jaccard-like" weighting idea.
+ms <- FindNeighbors(ms, dims = dims_use, k.param = k_nn, verbose = FALSE)
+ms <- FindClusters(ms, algorithm = 1, resolution = 0.5, verbose = FALSE)  # algorithm=1 is Louvain
+
+# --- 7) UMAP visualization (you asked for UMAP; paper used t-SNE) ---
+ms <- RunUMAP(ms, dims = dims_use, n.neighbors = k_nn, min.dist = 0.3, verbose = FALSE)
+
+# Plot
+p_umap_clusters <- DimPlot(ms, reduction = "umap", group.by = "seurat_clusters", label = TRUE) + NoLegend()
+p_umap_donor    <- DimPlot(ms, reduction = "umap", group.by = "orig.ident")
+p_umap_cond     <- DimPlot(ms, reduction = "umap", group.by = "condition")
+
+p_umap_clusters
+# p_umap_donor
+# p_umap_cond
+
+```
