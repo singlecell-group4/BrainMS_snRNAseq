@@ -392,11 +392,8 @@ p_umap_clusters
 
 ## Solve the metadata problem
 
-```{}
-```
-
 ```{r}
-ms_data <- readRDS("/home/projects/exam_2026_22102/group4/data/ms_filtered_full.rds")
+ms_data <- readRDS("/home/projects/exam_2026_22102/group4/data/ms_filtered_new.rds")
 
 meta_raw <- read.delim(
   "/home/projects/exam_2026_22102/group4/data/MultipleSclerosisLineageDiversity 2026-01-17 12.57.tsv",
@@ -462,9 +459,30 @@ all(!is.na(ms_data$condition))
 ```
 
 ```{r}
+sample_md <- unique(ms_data@meta.data[, c("input_id", "condition")])
+
+table(sample_md$condition)
+
+```
+
+```{r}
+sample_md <- unique(ms_data@meta.data[, c("input_id", "sex")])
+
+table(sample_md$sex)
+
+```
+
+```{r}
+sample_md <- unique(ms_data@meta.data[, c("input_id", "condition", "sex")])
+
+table(sample_md$condition, sample_md$sex)
+
+```
+
+```{r}
 saveRDS(
   ms_data,
-  file = "/home/projects/exam_2026_22102/group4/data/ms_filtered_full_with_metadata.rds",
+  file = "/home/projects/exam_2026_22102/group4/data/ms_filtered_new_with_metadata.rds",
   compress = "xz"
 )
 
