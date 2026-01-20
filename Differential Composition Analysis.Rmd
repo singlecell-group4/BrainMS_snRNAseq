@@ -3,3 +3,123 @@ title: "Differential Composition Analysis"
 output: html_document
 ---
 
+# Differential Composition Analysis
+
+## Libraries
+
+```{r}
+library(Seurat)
+library(DCATS)
+```
+
+## Read the data
+
+```{r}
+ms_data <- readRDS("/home/projects/exam_2026_22102/group4/data/ms_filtered_new_celltype.rds")
+```
+
+## Similarity matrix from SNN and cell type labels
+
+```{r}
+knn_mat <- knn_simMat(ms_data@graphs$RNA_snn, ms_data$cell_type_manual)
+
+```
+
+## Count matrix
+
+```{r}
+count_mat <- table(ms_data$input_id, ms_data$cell_type_manual)
+```
+
+## Design matrix
+
+```{r}
+sample_condition <- tapply(
+  ms_data$condition,
+  ms_data$input_id,
+  function(x) unique(as.character(x))[1]
+)
+sample_condition <- sample_condition[rownames(count_mat)]
+
+sim_design <- data.frame(
+  condition = ifelse(sample_condition == "MS", "case", "ctrl"),
+  row.names = rownames(count_mat)
+)
+```
+
+## Differential composition test
+
+```{r}
+dcats_res <- dcats_GLM(count_mat, sim_design, knn_mat)
+dcats_res
+```
+
+## Save results in a dataframe
+
+```{r}
+res_df <- data.frame(
+  cell_type = rownames(dcats_res$fdr),
+  coeff     = dcats_res$ceoffs[, "condition"],
+  se        = dcats_res$coeffs_err[, "condition"],
+  LR        = dcats_res$LR_vals[, "condition"],
+  pval      = dcats_res$LRT_pvals[, "condition"],
+  fdr       = dcats_res$fdr[, "condition"],
+  row.names = NULL
+)
+res_df <- res_df[order(res_df$fdr), ]
+print(res_df)
+
+write.csv(res_df, "DCATS_results.csv", row.names = FALSE)
+```
+
+## Plots
+
+```{r}
+library(dplyr)
+library(ggplot2)
+
+# Build proportion dataframe
+prop_df <- as.data.frame(table(ms_data$input_id, ms_sub$cell_type_manual)) %>%
+  setNames(c("sample", "cell_type", "n")) %>%
+  left_join(
+    ms_data@meta.data %>%
+      select(input_id, condition) %>%
+      distinct(),
+    by = c("sample" = "input_id")
+  ) %>%
+  group_by(sample) %>%
+  mutate(prop = n / sum(n)) %>%
+  ungroup()
+
+# Order cell types by DCATS effect size 
+cell_order <- res_df$cell_type
+prop_df$cell_type <- factor(prop_df$cell_type, levels = cell_order)
+
+# Plot
+p <- ggplot(prop_df, aes(x = condition, y = prop, fill = condition)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.7) +
+  geom_jitter(width = 0.15, size = 1.8, alpha = 0.8) +
+  facet_wrap(~ cell_type, scales = "free_y", nrow = 2) +
+  theme_bw(base_size = 12) +
+  labs(
+    title = "Cell-type proportions per sample (DCATS input)",
+    y = "Proportion of cells",
+    x = NULL
+  ) +
+  theme(
+    legend.position = "none",
+    strip.background = element_rect(fill = "grey90"),
+    strip.text = element_text(face = "bold")
+  )
+
+print(p)
+
+ggsave(
+  "DCATS_celltype_proportions_MS_vs_Control.png",
+  p,
+  width = 14,
+  height = 7,
+  dpi = 300
+)
+
+```
