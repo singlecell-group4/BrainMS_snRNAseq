@@ -1,0 +1,205 @@
+---
+title: "Resolution searching"
+format: html
+editor: visual
+---
+
+## Search if integration is needed
+
+```{r}
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(ggplot2)
+  library(patchwork)
+  library(dplyr)
+  library(clustree)
+  library(tidyverse)
+})
+
+```
+
+```{r}
+ms_data.filtered <- readRDS("/home/projects/exam_2026_22102/group4/data/ms_filtered_new_with_metadata.rds")
+```
+
+Check is the samples are well distributed across the clusters or we see sample specific clustering.
+
+```{r}
+p1 <- DimPlot(
+  ms_data.filtered,
+  reduction = "umap",
+  group.by = "input_id"
+) + ggtitle("UMAP coloured by sample (input_id)")
+
+```
+
+```{r}
+# 1. Define the file path
+output_path <- "/home/projects/exam_2026_22102/group4/umap_coloured_bysample.png"
+
+# 2. Save the plot
+# You can adjust width and height to make sure the labels are readable
+ggsave(filename = output_path, 
+       plot = p1,
+       width = 12, 
+       height = 10, 
+       dpi = 300)
+```
+
+```{r}
+p2 <- DimPlot(
+  ms_data.filtered,
+  reduction = "umap",
+  group.by = "sex"
+) + ggtitle("UMAP coloured by sex")
+
+```
+
+```{r}
+p4 <- DimPlot(
+  ms_data.filtered,
+  reduction = "umap",
+  split.by = "condition"
+) + ggtitle("UMAP coloured by condition")
+```
+
+```{r}
+
+# 1. Define the file path
+output_path <- "/home/projects/exam_2026_22102/group4/umap_coloured_bycondition.png"
+
+# 2. Save the plot
+# You can adjust width and height to make sure the labels are readable
+ggsave(filename = output_path, 
+       plot = p4,
+       width = 12, 
+       height = 10, 
+       dpi = 300)
+```
+
+```{r}
+# 1. Define the file path
+output_path <- "/home/projects/exam_2026_22102/group4/umap_coloured_bysex.png"
+
+# 2. Save the plot
+# You can adjust width and height to make sure the labels are readable
+ggsave(filename = output_path, 
+       plot = p2,
+       width = 12, 
+       height = 10, 
+       dpi = 300)
+```
+
+```{r}
+p3 <- DimPlot(
+  ms_data.filtered,
+  reduction = "umap",
+  split.by = "input_id",
+  ncol = 4
+)
+
+```
+
+```{r}
+
+# 1. Define the file path
+output_path <- "/home/projects/exam_2026_22102/group4/umap_coloured_bysample_split.png"
+
+# 2. Save the plot
+# You can adjust width and height to make sure the labels are readable
+ggsave(filename = output_path, 
+       plot = p3,
+       width = 12, 
+       height = 10, 
+       dpi = 300)
+```
+
+### Find optimal resolution
+
+```{r}
+res_cols <- grep("^RNA_snn_res", colnames(ms_data.filtered@meta.data), value = TRUE)
+res_cols
+```
+
+```{r}
+# Identify all columns that start with "RNA_snn_res."
+old_res_cols <- grep("RNA_snn_res.", colnames(ms_data.filtered@meta.data), value = TRUE)
+
+# Remove them from the metadata
+ms_data.filtered@meta.data[old_res_cols] <- NULL
+```
+
+```{r}
+ms_data.filtered <- FindClusters(
+  ms_data.filtered, 
+  resolution = c(0.3, 0.5, 0.7, 0.9, 1.1),
+  algorithm = 1  # 1 = Louvain
+)
+```
+
+```{r}
+clustree <- clustree(ms_data.filtered, prefix = "RNA_snn_res.")+
+    guides(edge_alpha = "none") # This keeps the legend focused on resolution
+```
+
+```{r}
+clustree
+```
+
+```{r}
+# Define the full path and filename
+save_path <- "/home/projects/exam_2026_22102/group4/ms_filtered_new_with_metadata.rds"
+
+# Save the object
+saveRDS(ms_data.filtered, file = save_path)
+```
+
+```{r}
+# 1. Define the file path
+output_path <- "/home/projects/exam_2026_22102/group4/clustree_louvain_8markers.png"
+
+# 2. Save the plot
+# You can adjust width and height to make sure the labels are readable
+ggsave(filename = output_path, 
+       plot = clustree,
+       width = 12, 
+       height = 10, 
+       dpi = 300)
+```
+
+```{r}
+# Setting resolution 0.5 
+Idents(ms_data.filtered) <- "RNA_snn_res.0.5"
+```
+
+```{r}
+# Generate the UMAP plot for res 0.5
+p_res05 <- DimPlot(
+  ms_data.filtered, 
+  reduction = "umap", 
+  group.by = "RNA_snn_res.0.5", 
+  label = TRUE, 
+  label.size = 5
+) + ggtitle("UMAP Clustering: Resolution 0.5")
+
+# Display the plot
+p_res05
+```
+
+Cell annotation.
+
+```{r}
+# Find genes that are uniquely high in each cluster
+all_markers <- FindAllMarkers(ms_data.filtered, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25)
+
+```
+
+```{r}
+# Use the correct function: group_by (with underscore)
+top5 <- all_markers %>% 
+  group_by(cluster) %>% 
+  slice_max(n = 10, order_by = avg_log2FC)
+
+# View the top genes
+print(top5)
+```
