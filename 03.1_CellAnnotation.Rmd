@@ -1,0 +1,183 @@
+---
+title: "03.1_CellAnnotation"
+output: html_document
+---
+
+```{r}
+suppressPackageStartupMessages({
+library(Seurat)
+library(ggplot2)
+library(patchwork)
+library(dplyr)
+library(harmony)
+library(tidyr)
+library(multtest)
+library(metap)
+library(tibble)
+})
+```
+
+```{r}
+ms_data.new <- readRDS("/home/projects/exam_2026_22102/group4/data/ms_filtered_new_with_metadata.rds")
+```
+
+Identify neighbors using the new CCA reductions and check different resolutions:
+
+```{r}
+pbmc.MTB.cca <- FindNeighbors(pbmc.MTB, dims = 1:14, reduction = "CCA_Integration", graph.name = "CCA_snn")
+pbmc.MTB.cca <- FindClusters(pbmc.MTB.cca, resolution = c(0.4, 0.6, 0.8, 1.0, 1.2), algorithm = 4, graph.name = "CCA_snn")
+```
+
+Try Clustree to get the best resolution:
+
+```{r}
+FeaturePlot(ms_data.new , 
+            reduction = "umap", 
+            features = c("PLXDC2"), 
+            order = TRUE,
+            min.cutoff = 'q10', 
+            label = TRUE)
+```
+
+```{r}
+Celltype_markers <- list(
+  All_neurons = "SYT1",
+  Excitatory_neurons = "SLC17A7",
+  Inhibitory_neurons = "GAD2",
+  Astrocytes = "SLC1A3",
+  Oligodendrocytes = "PLP1",
+  Microglia = "P2RY12",
+  OL_progenitor = "PDGFRA",
+  Stromal = "LAMA2",
+  Pericytes = "PDGFRB",
+  Endothelial = "CLDN5",
+  Leukocytes = "PTPRC"
+)
+
+```
+
+```{r}
+# Loop over each element in the list and plot a violin plot
+for (cell_name in names(Celltype_markers)) {
+  p <- VlnPlot(ms_data.new, features = Celltype_markers[[cell_name]], pt.size=0)
+  print(p)
+  
+  ggsave(
+      filename = paste0("VlnPlot_", cell_name, "_", gene, ".png"),
+      plot = p,
+      width = 6,
+      height = 5,
+      dpi = 300
+    )
+}
+```
+
+```{r}
+# Loop over each element in the list and plot the expression of the markers
+for (cell_name in names(Celltype_markers)) {
+  p <- FeaturePlot(ms_data.new, 
+            reduction = "tsne", 
+            features = Celltype_markers[[cell_name]], 
+            order = TRUE,
+            min.cutoff = 'q10', 
+            label = FALSE) 
+  print(p)
+}
+```
+
+```{r}
+# Loop over each element in the list and plot the expression of the markers
+for (cell_name in names(Celltype_markers)) {
+  genes <- Celltype_markers[[cell_name]]
+
+  for (gene in genes) {
+    p <- FeaturePlot(
+      ms_data.new,
+      reduction = "umap",
+      features = gene,
+      order = TRUE,
+      min.cutoff = "q10"
+    )
+
+    ggsave(
+      filename = paste0("FeaturePlot_", cell_name, "_", gene, ".png"),
+      plot = p,
+      width = 6,
+      height = 5,
+      dpi = 300
+    )
+  }
+}
+
+```
+
+For unannotated clusters:
+
+```{r}
+cluster9_conserved_markers <- FindConservedMarkers(ms_data.new,
+                              ident.1 = 9,
+                              grouping.var = "condition",
+                              only.pos = TRUE, min.pct = 0.25,
+                              min.diff.pct = 0.25, logfc.threshold = 0.25)
+
+head(cluster9_conserved_markers)
+# To find markers for all the clusters, loop over each cluster of the list and find the expression of the conserved markers 
+```
+
+Automated clustering:
+
+```{r}
+library(SingleR)
+library(celldex)
+ref <- HumanPrimaryCellAtlasData()
+```
+
+```{r}
+cell_typ_dict_new <- c( 
+                    "0" = "EN",
+                    "1" = "Oligodendrocytes",
+                    "2" = "Astrocytes",
+                    "3" = "Oligodendrocytes",
+                    "4" = "EN",
+                    "5" = "OL-Progenitor", 
+                    "6" = "IN",
+                    "7" = "IN",
+                    "8" = "EN",
+                    "9" = "EN", 
+                    "10" = "Microglia",
+                    "11" = "Endothelial")
+```
+
+```{r}
+ms_data.new$cell_type_manual <- unname(cell_typ_dict_new[as.character(Idents(ms_data.new))])
+
+# Set as the cell identity if you want.
+Idents(ms_data.new) <- "cell_type_manual"
+```
+
+```{r}
+p <- DimPlot(
+  ms_data.new,
+  reduction = "umap",
+  label = TRUE,        # escribe las etiquetas
+  repel = TRUE,        # evita que se solapen
+  label.size = 5
+) + NoLegend()
+
+p
+ggsave(
+  filename = "UMAP_condition.png",
+  plot = p,
+  width = 8,
+  height = 6,
+  dpi = 300
+)
+```
+
+```{r}
+DimPlot(ms_data.new, reduction = "umap", group.by = "condition")
+```
+
+```{r}
+ggsave("UMAP_condition.png", width = 8, height = 6, dpi = 300)
+```
