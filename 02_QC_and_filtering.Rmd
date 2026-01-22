@@ -307,7 +307,7 @@ ms_data.filtered <- FindClusters(ms_data.filtered, resolution = c(0.3, 0.5, 0.7,
 
 ## UMAP (non-linear dim reduction)
 
-We now perform UMAP and plot them using the different resolutions. Due to working with brain samples, where the cell population is quite diverse (microglia and neuron subtypes9 and that we want to perform analyses on specific cell types, we will probably need a high resolution.
+We now perform UMAP and plot them using the different resolutions. Due to working with brain samples, where the cell population is quite diverse (microglia and neuron subtypes) and that we want to perform analyses on specific cell types, we will probably need a high resolution.
 
 ```{r}
 ms_data.filtered <- RunUMAP(ms_data.filtered, dims = 1:15)
@@ -338,6 +338,28 @@ DimPlot(ms_data.filtered, group.by = "RNA_snn_res.0.7", label = TRUE)
 DimPlot(ms_data.filtered, group.by = "RNA_snn_res.0.9", label = TRUE)
 ```
 
+**Saving the final Seurat object**
+
+Now all the reductions are included in the Seurat object, as well as the graphs used for clustering.
+
+We are using Seurat v5 where the RNA assay is an Assay5 object, so we need @layers$counts instead of just @counts to access the different data.
+
+```{r}
+# ms_data.filtered@assays$RNA@layers$counts
+# ms_data.filtered@assays$RNA@layers$data
+# ms_data.filtered@assays$RNA@layers$scale.data
+```
+
+```{r}
+ms_data.filtered@reductions$umap
+```
+
+Save the object in the common folder:
+
+```{r}
+saveRDS(ms_data.filtered, file = "/home/projects/exam_2026_22102/group4/data/ms_filtered_full.rds", compress = "xz")
+```
+
 # Reproducing results from paper
 
 ```{r}
@@ -347,24 +369,61 @@ library(Matrix)
 set.seed(1)
 DefaultAssay(ms_data) <- "RNA"
 
-# --- (Optional) basic QC filter first (use your chosen thresholds) ---
-ms <- ms_data
+# --- (Optional) basic QC filter first (use paper thresholds) ---
+ms <- subset(
+  ms_data,
+  subset =
+    nFeature_RNA >= 500 &
+    nCount_RNA   >= 1000
+)
 
 # --- 1) Filter genes expressed in > 5 nuclei (paper) ---
-counts <- GetAssayData(ms, assay = "RNA", slot = "counts")
-keep_genes <- Matrix::rowSums(counts > 0) > 5
+counts <- ms[["RNA"]]@layers$counts
+keep_genes <- Matrix::rowSums(counts > 0) >= 3
 ms <- subset(ms, features = names(keep_genes)[keep_genes])
+
+mt_genes <- grep("^MT-", rownames(ms), value = TRUE)
+ms <- subset(ms, features = setdiff(rownames(ms), mt_genes))
 
 # --- 2) "Filtered log-transformed UMI matrix" (paper) ---
 # This is Seurat's LogNormalize (counts per cell -> scale.factor -> log1p)
 ms <- NormalizeData(ms, normalization.method = "LogNormalize", scale.factor = 10000, verbose = FALSE)
+```
+
+```{r}
+ncol(ms) / ncol(ms_data)
+```
+
+```{r}
+nrow(ms_data)
+nrow(ms)
+```
+
+```{r}
+ms <- FindVariableFeatures(
+  ms,
+  selection.method = "vst",
+  nfeatures = 2000
+)
 
 # --- 3) Truncated SVD with k=50 (paper) ---
 # RunPCA with approx=TRUE uses a truncated SVD under the hood.
 # To stay closer to "SVD on log matrix", we avoid centering/scaling here.
-ms <- ScaleData(ms, features = rownames(ms), do.center = FALSE, do.scale = FALSE, verbose = FALSE)
-ms <- RunPCA(ms, npcs = 50, approx = TRUE, verbose = FALSE)
+ms <- ScaleData(
+  ms,
+  features = VariableFeatures(ms)
+)
 
+ms <- RunPCA(
+  ms,
+  features = VariableFeatures(ms),
+  npcs = 50
+)
+
+ElbowPlot(ms, ndims = 50)
+```
+
+```{r}
 # --- 4) Select 11 PCs (paper chose 11) ---
 dims_use <- 1:11
 
@@ -379,6 +438,20 @@ ms <- FindClusters(ms, algorithm = 1, resolution = 0.5, verbose = FALSE)  # algo
 # --- 7) UMAP visualization (you asked for UMAP; paper used t-SNE) ---
 ms <- RunUMAP(ms, dims = dims_use, n.neighbors = k_nn, min.dist = 0.3, verbose = FALSE)
 
+ms <- RunTSNE(
+  ms,
+  dims = 1:11,     
+  perplexity = 30, 
+  check_duplicates = FALSE
+)
+```
+
+```{r}
+DimPlot(ms, reduction = "tsne", label = TRUE)
+DimPlot(ms, reduction = "umap", label = TRUE)
+```
+
+```{r}
 # Plot
 p_umap_clusters <- DimPlot(ms, reduction = "umap", group.by = "seurat_clusters", label = TRUE) + NoLegend()
 p_umap_donor    <- DimPlot(ms, reduction = "umap", group.by = "orig.ident")
@@ -387,103 +460,13 @@ p_umap_cond     <- DimPlot(ms, reduction = "umap", group.by = "condition")
 p_umap_clusters
 # p_umap_donor
 # p_umap_cond
-
-```
-
-## Solve the metadata problem
-
-```{r}
-ms_data <- readRDS("/home/projects/exam_2026_22102/group4/data/ms_filtered_new.rds")
-
-meta_raw <- read.delim(
-  "/home/projects/exam_2026_22102/group4/data/MultipleSclerosisLineageDiversity 2026-01-17 12.57.tsv",
-  sep = "\t",
-  stringsAsFactors = FALSE
-)
-
 ```
 
 ```{r}
-input_ids <- unique(as.character(ms_data$input_id))
-
-overlap <- sapply(meta_raw, function(x) {
-  sum(input_ids %in% as.character(x))
-})
-
-overlap <- sort(overlap, decreasing = TRUE)
-overlap[1:10]
-
-best_col <- names(overlap)[1]
-best_overlap <- overlap[1]
-
-stopifnot(best_overlap > 0)
-best_col
-
+ms_data.new <- ms
+saveRDS(ms_data.new, file = "/home/projects/exam_2026_22102/group4/data/ms_filtered_new.rds", compress = "xz")
 ```
 
 ```{r}
-meta <- data.frame(
-  input_id = as.character(meta_raw[[best_col]]),
-  sex = meta_raw$`donor_organism.sex`,
-  condition = ifelse(
-    grepl("multiple sclerosis", 
-          meta_raw$`donor_organism.diseases`, 
-          ignore.case = TRUE),
-    "MS",
-    "Control"
-  ),
-  stringsAsFactors = FALSE
-)
-
-# Keep one row per input_id
-meta <- meta[!duplicated(meta$input_id), ]
-
-```
-
-```{r}
-ms_data$sex <- meta$sex[match(ms_data$input_id, meta$input_id)]
-ms_data$condition <- meta$condition[match(ms_data$input_id, meta$input_id)]
-
-ms_data$sex <- factor(ms_data$sex)
-ms_data$condition <- factor(ms_data$condition)
-
-```
-
-```{r}
-table(ms_data$sex, useNA = "ifany")
-table(ms_data$condition, useNA = "ifany")
-
-all(!is.na(ms_data$sex))
-all(!is.na(ms_data$condition))
-
-```
-
-```{r}
-sample_md <- unique(ms_data@meta.data[, c("input_id", "condition")])
-
-table(sample_md$condition)
-
-```
-
-```{r}
-sample_md <- unique(ms_data@meta.data[, c("input_id", "sex")])
-
-table(sample_md$sex)
-
-```
-
-```{r}
-sample_md <- unique(ms_data@meta.data[, c("input_id", "condition", "sex")])
-
-table(sample_md$condition, sample_md$sex)
-
-```
-
-```{r}
-saveRDS(
-  ms_data,
-  file = "/home/projects/exam_2026_22102/group4/data/ms_filtered_new_with_metadata.rds",
-  compress = "xz"
-)
 
 ```
